@@ -1,10 +1,12 @@
 #!/usr/bin/python
 
+from __future__ import print_function
 import argparse, os, collections, bisect, platform
-import midi
+import mido
 from itertools import islice
 from fractions import gcd
 from glob import glob
+import functools
 
 
 notes = ["NC2", "NCS2", "ND2", "NDS2", "NE2", "NF2",
@@ -44,6 +46,7 @@ def main():
     parser.add_argument('-O', '--optimize', action='store_true', help='Use optimize status')
     parser.add_argument('-o', '--output', help='File to output to')
     parser.add_argument('-j', '--json', action='store_true', help='Use JSON format')
+    parser.add_argument('-c', '--channels', type=int, help='Number of channels to parse per MIDI', default=2)
     parser.add_argument("-v", "--verbosity", action="count", default=0, help='Each use increases verbosity level')
 
     args = parser.parse_args()
@@ -51,10 +54,10 @@ def main():
     verbose = args.verbosity
 
     if verbose > 0:
-        print args
+        print(args)
 
     if args.output:
-        outFile = open(args.output, 'wb+') # Open byte-wise to ensure consistent line endings
+        outFile = open(args.output, 'w+') # Open byte-wise to ensure consistent line endings
         outFile.write("[\n")
     else:
         outFile = None
@@ -69,17 +72,17 @@ def main():
         files = args.files
     
     for f in files:
-        print "Now processing: " + f
-        processFile(f, optimize=args.optimize, printJSON=args.json, outFile=outFile);
+        print("Now processing: " + f)
+        processFile(f, optimize=args.optimize, numChannels=args.channels, printJSON=args.json, outFile=outFile);
 
     if args.output:
-        outFile.seek(-2, os.SEEK_END)
+        outFile.seek(outFile.tell() - 2 - (platform.system() == 'Windows'), os.SEEK_SET)   # os.SEEK_SET == 0
         outFile.truncate() # Remove trailing comma
         outFile.write("\n]\n")
 
     if args.optimize and len(files) > 1:
         fmtString = 'Total bytes saved from optimization: {}/{} ({:.2f}%)'
-        print fmtString.format(totalSaved, totalBytes, (totalSaved*100.0)/totalBytes)
+        print(fmtString.format(totalSaved, totalBytes, (totalSaved*100.0)/totalBytes))
 
 def window(seq, n=2):
     it = iter(seq)
@@ -106,21 +109,30 @@ def initValueDict():
     for duration in duration_strings:
         value_dict[duration] = i
         i += 1
+        
 
+def make_times_abs(events):
+    time = 0
+    for msg in enumerate(events):
+        time += msg[1].time
+        msg[1].time = time
+        if msg[1].type == 'end_of_track':
+            time = 0 # Reset time on end of track
+            
 
 #sorts events such that meta < noteoff < noteon w/ 0 vel < noteon
 #other types will sort below/above noteon/off depending on their midi value
 def eventSort(x, y):
-    if x.statusmsg == 0xFF and y.statusmsg != 0xFF:
+    if x.is_meta and not y.is_meta:
         return -1
-    elif y.statusmsg == 0xFF and x.statusmsg != 0xFF:
+    elif y.is_meta and not x.is_meta:
         return 1
 
-    if x.statusmsg > y.statusmsg:
+    if x.type == 'note_on' and y.type != 'note_on':
         return 1
-    elif x.statusmsg <  y.statusmsg:
+    elif x.type != 'note_on' and y.type == 'note_on':
         return -1
-    elif x.statusmsg == 0x90 and y.statusmsg == 0x90:
+    elif x.type == 'note_on' and y.type == 'note_on':
         if x.velocity > y.velocity:
             return 1
         elif x.velocity < y.velocity:
@@ -129,23 +141,21 @@ def eventSort(x, y):
             return 0
     else:
         return 0
-
+        
 
 def processFile(filename, optimize=False, numChannels=2, printJSON=False, outFile=None):
     global noteEncountered, tempoChanges
     if verbose > 2:
-        print "Entering processFile()"
+        print("Entering processFile()")
 
     noteEncountered = False
     tempoChanges = False
 
-    pattern = midi.read_midifile(filename)
-
-    pattern.make_ticks_abs()
+    pattern = mido.MidiFile(filename)
 
     if verbose > 2:
-        print pattern
-        print '\n'
+        print(pattern)
+        print('\n')
 
     channels = []
 
@@ -153,29 +163,34 @@ def processFile(filename, optimize=False, numChannels=2, printJSON=False, outFil
         channels.append({"Busy": False, "Pending":(), "Notes": []})
 
     #Flattens to a single list
-    events = [item for sublist in pattern for item in sublist]
+    events = [item for sublist in pattern.tracks for item in sublist]
+
+    #Adjust event times to be absolute
+    make_times_abs(events)
 
     #Because sorting is stable we can sort on type and then timestamp to ensure off's come
     # before equivalent tick on events
-    events = sorted(events, cmp=eventSort)
-    events = sorted(events, key=lambda x: x.tick)
-
+    events = sorted(events, key=functools.cmp_to_key(eventSort))
+    events = sorted(events, key=lambda x: x.time)
+    
     for e in events:
         processEvent(e, channels)
 
     if verbose > 2:
-        print '\n'
+        print('\n')
+
+    trimLeadingSilence(channels)
 
     #TODO: doesn't work yet
     #if not tempoChanges:
     #    resolution = checkResolution(channels, pattern.resolution/4)
     #else:
-    resolution = pattern.resolution/(4*3)
+    resolution = pattern.ticks_per_beat/(4*3)
 
     uspq = channels[0].get("Tempo", 500000)
     tsD = channels[0].get("TimeSignature", 4.0)
 
-    multiplier = calculateTiming(channels, pattern.resolution, uspq=uspq, tsDenominator=tsD)
+    multiplier = calculateTiming(channels, pattern.ticks_per_beat, uspq=uspq, tsDenominator=tsD)
 
     #Just need the notes now, can drop all other information
     for i in range(len(channels)):
@@ -185,7 +200,7 @@ def processFile(filename, optimize=False, numChannels=2, printJSON=False, outFil
     channels = [x for x in channels if x]
 
     if verbose > 0 and len(channels) != numChannels:
-        print "NOTE: Pruned at least one empty channel"
+        print("NOTE: Pruned at least one empty channel")
 
     channels = insertRests(channels, resolution)
     channels = splitLongNotes(channels, resolution)
@@ -199,7 +214,7 @@ def processFile(filename, optimize=False, numChannels=2, printJSON=False, outFil
     printResult(channels, multiplier, filename, json=printJSON, outFile=outFile)
 
     if verbose > 2:
-        print "Exiting processFile()\n"
+        print("Exiting processFile()\n")
 
 
 def processEvent(event, channels):
@@ -208,54 +223,77 @@ def processEvent(event, channels):
     if len(channels) <= 0:
         raise ValueError("There must be at least one channel")
 
-    if event.statusmsg == 0x90 and event.velocity > 0:
-        noteEncountered = True
-        processNoteOn(event, channels)
+    if event.type == 'note_on':
+        if event.velocity > 0:
+            noteEncountered = True
+            processNoteOn(event, channels)
+        else:
+            processNoteOff(event, channels)
 
-    elif event.statusmsg == 0x90 and event.velocity == 0:
+    elif event.type == 'note_off':
         processNoteOff(event, channels)
 
-    elif event.statusmsg == 0x80:
-        processNoteOff(event, channels)
-
-    elif event.statusmsg == 0xFF and event.metacommand == 0x51: #set tempo event
+    elif event.is_meta and event.type == 'set_tempo': #set tempo event
         if noteEncountered:
-            tempo = ("TEMPO", event.tick, event.tick, event.get_mpqn())
+            tempo = ("TEMPO", event.time, event.time, event.tempo)
             if verbose > 2:
-                print "Tempo change:", tempo
+                print("Tempo change:", tempo)
 
             for channel in channels:
                 channel["Notes"].append(tempo)
                 tempoChanges = True
         else:
-            channels[0]["Tempo"] = event.get_mpqn()
-            print "Tempo event, new uS/Q:", channels[0]["Tempo"]
+            channels[0]["Tempo"] = event.tempo
+            print("Tempo event, new uS/Q:", channels[0]["Tempo"])
 
-    elif event.statusmsg == 0xFF and event.metacommand == 0x58: #time signature event
-        channels[0]["TimeSignature"] = event.get_denominator()
+    elif event.is_meta and event.type == 'time_signature': #time signature event
+        channels[0]["TimeSignature"] = event.denominator
         if verbose > 2:
-            print "Time signature event, new denominator:", channels[0]["TimeSignature"]
+            print("Time signature event, new denominator:", channels[0]["TimeSignature"])
+
+
+def trimLeadingSilence(channels):
+    if verbose > 2:
+        print("Entering trimLeadingSilence()")
+        print(channels)
+
+    #If all channels start at a fixed tick value shift all notes so that tick is 0
+    if all(channel["Notes"][0][1] != 0 for channel in channels):
+        if verbose > 1:
+            print("Trimming Leading silence")
+        offset = min(channel["Notes"][0][1] for channel in channels)
+
+        for channel in channels:
+            tempNotes = []
+            for note in channel["Notes"]:
+                n = (note[0], note[1] - offset, note[2] - offset) + note[3:]
+                tempNotes.append(n)
+            channel["Notes"] = tempNotes
+
+    if verbose > 2:
+        print("\n")
+        print(channels)
+        print("Exiting trimLeadingSilence()")
 
 def processNoteOn(note, channels):
-    pitch = notes[note.get_pitch()-24]
+    pitch = notes[note.note-24]
     if verbose > 2:
-        print pitch, "on:", note.tick
+        print(pitch, "on:", note.time)
 
     #add to first available channel
     for channel in channels:
         if not channel["Busy"]:
             channel["Busy"] = True
-            channel["Pending"] = (pitch, note.tick, 0)
+            channel["Pending"] = (pitch, note.time, 0)
             return
 
-    print "WARNING: All channels busy; dropping note..."
-
+    print("WARNING: All channels busy; dropping note...")
 
 def processNoteOff(note, channels):
-    pitch = notes[note.get_pitch()-24]
+    pitch = notes[note.note-24]
 
     if verbose > 2:
-        print pitch, "off:", note.tick
+        print(pitch, "off:", note.time)
 
     #Find corresponding note
     for channel in channels:
@@ -263,28 +301,28 @@ def processNoteOff(note, channels):
             pending = channel["Pending"]
             if pending[0] == pitch:
                 channel["Busy"] = False
-                channel["Notes"].append((pitch, pending[1], note.tick))
+                channel["Notes"].append((pitch, pending[1], note.time))
                 channel["Pending"] = ()
                 return
 
-    print "WARNING: Can't find corresponding note..."
+    print("WARNING: Can't find corresponding note...")
 
 def checkResolution(channels, resolution):
     if verbose > 2:
-        print "Entering checkResolutions()"
+        print("Entering checkResolutions()")
 
     g = []
     for i in range(len(channels)):
-        durations = map(lambda w: w[1][1] - w[0][1], window(channels[i]["Notes"]))
+        durations = [w[1][1] - w[0][1] for w in window(channels[i]["Notes"])]
         g.append(reduce(gcd, durations, resolution))
 
     r = reduce(gcd, g)
 
     if verbose > 2:
-        print 'GCD: {}\nGCD % resolution ({}): {}'.format(r, resolution, r % resolution)
+        print('GCD: {}\nGCD % resolution ({}): {}'.format(r, resolution, r % resolution))
 
     if r % resolution != 0:
-        print "WARNING: Something may be wrong with durations, attempting to correct"
+        print("WARNING: Something may be wrong with durations, attempting to correct")
 
         factor = 2
         distance = abs(resolution - r)
@@ -294,18 +332,18 @@ def checkResolution(channels, resolution):
 
         factor /= 2
 
-        print "WARNING: Adjusting resolution to", r/factor
+        print("WARNING: Adjusting resolution to", r/factor)
         if verbose > 2:
-            print "Exiting checkResolutions()\n"
+            print("Exiting checkResolutions()\n")
         return r/factor
     else:
         if verbose > 2:
-            print "Exiting checkResolutions()\n"
+            print("Exiting checkResolutions()\n")
         return resolution
 
 def calculateTiming(channels, patternResolution, uspq=500000, tsDenominator=4.0):
     if verbose > 2:
-        print "Entering calculateTiming()"
+        print("Entering calculateTiming()")
 
     SecondsPerQuarterNote = uspq / 1000000.0
     SecondsPerTick = SecondsPerQuarterNote / patternResolution
@@ -314,22 +352,22 @@ def calculateTiming(channels, patternResolution, uspq=500000, tsDenominator=4.0)
     multiplier = int(uspq/12000) #BASE quarter length is 12ms
 
     if verbose > 0:
-        print "Tick Length (s)", SecondsPerTick
-        print "Sixteenth note duration set to", patternResolution/4, "ticks"
-        print "Length of sixteenth", (SecondsPerTick*patternResolution)/4
-        print "uS/Q", uspq
+        print("Tick Length (s)", SecondsPerTick)
+        print("Sixteenth note duration set to", patternResolution/4, "ticks")
+        print("Length of sixteenth", (SecondsPerTick*patternResolution)/4)
+        print("uS/Q", uspq)
 
-    print "BPM", bpm
-    print "Multiplier", multiplier
+    print("BPM", bpm)
+    print("Multiplier", multiplier)
 
     if verbose > 2:
-        print "Exiting calculateTiming()\n"
+        print("Exiting calculateTiming()\n")
     return multiplier
 
 
 def insertRests(channels, resolution):
     if verbose > 2:
-        print "Entering insertRests()"
+        print("Entering insertRests()")
 
     tempChannels = []
     for channel in channels:
@@ -341,8 +379,8 @@ def insertRests(channels, resolution):
             tempChannel.append(n)
 
             if verbose > 2:
-                print "Adding rest to beginning of channel"
-                print n
+                print("Adding rest to beginning of channel")
+                print(n)
 
         for w in window(channel):
             #if (start of note - prev note's stop) < 2*resolution then a rest is needed
@@ -361,8 +399,8 @@ def insertRests(channels, resolution):
                 tempChannel.append(n)
 
                 if verbose > 2:
-                    print t
-                    print n
+                    print(t)
+                    print(n)
 
             else:
                 if w[0][0] is not "TEMPO":
@@ -372,7 +410,7 @@ def insertRests(channels, resolution):
                 tempChannel.append(t)
 
                 if verbose > 2:
-                    print t
+                    print(t)
 
         #fix timing and append the final note
         n = (
@@ -384,10 +422,10 @@ def insertRests(channels, resolution):
         tempChannels.append(tempChannel)
 
     if verbose > 1:
-        print '\n'
+        print('\n')
 
     if verbose > 2:
-        print "Exiting insertRests()\n"
+        print("Exiting insertRests()\n")
 
     return tempChannels
 
@@ -397,7 +435,7 @@ def doOptimize(channels):
     global totalSaved, totalBytes
 
     if verbose > 2:
-        print "Entering doOptimize()"
+        print("Entering doOptimize()")
 
     tempChannels = []
 
@@ -419,19 +457,19 @@ def doOptimize(channels):
 
     fmtString = 'Bytes saved from optimization pass: {}/{} ({:.2f}%)'
     outString = fmtString.format(songSaved, songBytes, (songSaved*100.0)/songBytes)
-    print outString
+    print(outString)
 
     totalSaved += songSaved
     totalBytes += songBytes
 
     if verbose > 2:
-        print "Exiting doOptimize()\n"
+        print("Exiting doOptimize()\n")
     return tempChannels
 
 
 def splitLongNotes(channels, resolution):
     if verbose > 2:
-        print "Entering splitLongNotes()"
+        print("Entering splitLongNotes()")
 
     tempChannels = []
     for channel in channels:
@@ -441,13 +479,13 @@ def splitLongNotes(channels, resolution):
 
             if note[2]-note[1] > resolution*48:
                 if verbose > 1:
-                    print "WARNING: found note too long,", note
+                    print("WARNING: found note too long,", note)
 
                 split = []
                 offset = note[1]
                 while duration != 0:
                     if duration % resolution != 0 or duration < resolution*2:
-                        print "WARNING: no way to split note, duration not a multiple of resolution"
+                        print("WARNING: no way to split note, duration not a multiple of resolution")
 
                     if duration > resolution*48:
                         duration -= resolution*48
@@ -458,7 +496,7 @@ def splitLongNotes(channels, resolution):
                         duration -= duration
 
                 if verbose > 1:
-                    print "Split long note into:", split
+                    print("Split long note into:", split)
                 tempChannel.extend(split)
 
             else:
@@ -467,14 +505,14 @@ def splitLongNotes(channels, resolution):
                 
 
     if verbose > 2:
-        print "Exiting splitLongNotes()\n"
+        print("Exiting splitLongNotes()\n")
 
     return tempChannels
 
 
 def convertDurations(channels, resolution):
     if verbose > 2:
-        print "Entering convertDurations()"
+        print("Entering convertDurations()")
 
     durations = collections.OrderedDict([
         (resolution *  2, "DTS"),
@@ -492,20 +530,20 @@ def convertDurations(channels, resolution):
     ])
 
     if verbose > 1:
-        print "Sixteenth resolution", resolution * 3
-        print "Durations", durations
+        print("Sixteenth resolution", resolution * 3)
+        print("Durations", durations)
 
     tempChannels = []
     for channel in channels:
         tempChannel = []
         for note in channel:
-            ind = bisect.bisect_left(durations.keys(), (note[2] - note[1]))
+            ind = bisect.bisect_left(list(durations.keys()), (note[2] - note[1]))
 
-            if (note[2] - note[1]) != durations.keys()[ind] and note[0] is not "TEMPO":
+            if (note[2] - note[1]) != list(durations.keys())[ind] and note[0] is not "TEMPO":
                 notes = handleOddDuration(durations, resolution, note)
 
                 if verbose > 1:
-                    print "WARNING: Odd duration", note, "->", notes
+                    print("WARNING: Odd duration", note, "->", notes)
 
                 for n in notes:
                     tempChannel.append(n)
@@ -520,28 +558,28 @@ def convertDurations(channels, resolution):
                 newNote = (note[0], str(int(note[3]/12000)))
 
             if verbose > 2:
-                print note, note[2]-note[1], ind, "->", newNote
+                print(note, note[2]-note[1], ind, "->", newNote)
 
             tempChannel.append(newNote)
         tempChannels.append(tempChannel)
 
     if verbose > 2:
-        print "Exiting convertDurations()\n"
+        print("Exiting convertDurations()\n")
     return tempChannels
 
 
 def handleOddDuration(durations, resolution, note):
     if verbose > 2:
-        print "Entering handleOddDuration()"
+        print("Entering handleOddDuration()")
 
-    ind = bisect.bisect_left(durations.keys(), (note[2] - note[1]))
+    ind = bisect.bisect_left(list(durations.keys()), (note[2] - note[1]))
     temp = []
 
     #TODO: up the verbosity level on this?
     if verbose > 2:
-        print "len(actual), len(note), delta, resolution"
-        print (note[2] - note[1]), durations.keys()[ind], durations.keys()[ind] - (note[2] - note[1]), resolution
-        print note
+        print("len(actual), len(note), delta, resolution")
+        print((note[2] - note[1]), list(durations.keys())[ind], list(durations.keys())[ind] - (note[2] - note[1]), resolution)
+        print(note)
 
     #TODO: this doesn't work if the duration is < 2*resolution
 
@@ -551,21 +589,21 @@ def handleOddDuration(durations, resolution, note):
         i = ind - 1
         temp = []
         while remaining != 0 and i >= 0:
-            if durations.keys()[i] <= remaining:
+            if list(durations.keys())[i] <= remaining:
                 temp.append((note[0], duration_strings[i]))
-                remaining = remaining - durations.keys()[i]
+                remaining = remaining - list(durations.keys())[i]
             else:
                 i = i - 1
         ind = ind - 1
 
     if verbose > 2:
-        print "Exiting handleOddDuration()\n"
+        print("Exiting handleOddDuration()\n")
     return temp
 
 
 def doSanityChecks(channels):
     if verbose > 2:
-        print "Entering doSanityChecks()"
+        print("Entering doSanityChecks()")
 
     durations = dict([
         ("DTS",  2),
@@ -592,17 +630,17 @@ def doSanityChecks(channels):
         lengths.append(l)
 
     if lengths.count(lengths[0]) != len(lengths):
-        print "WARNING: Track lengths differ (may not be an issue):", lengths
+        print("WARNING: Track lengths differ (may not be an issue):", lengths)
 
     if verbose > 2:
-        print "Exiting doSanityChecks()\n"
+        print("Exiting doSanityChecks()\n")
 
 def printResult(channels, multiplier, filename, json=False, outFile=None):
-    print"\n"
+    print("\n")
     if not outFile:
-        print "===================================================================="
-        print "Begin Output for " + filename
-        print "====================================================================\n"
+        print("====================================================================")
+        print("Begin Output for " + filename)
+        print("====================================================================\n")
 
     if json:
         printResultJSON(channels, multiplier, filename, outFile=outFile)
@@ -610,9 +648,9 @@ def printResult(channels, multiplier, filename, json=False, outFile=None):
         printResultString(channels, multiplier, filename, outFile=outFile)
 
     if not outFile:
-        print "===================================================================="
-        print "End Output for " + filename
-        print "====================================================================\n"
+        print("====================================================================")
+        print("End Output for " + filename)
+        print("====================================================================\n")
 
 def printResultJSON(channels, multiplier, filename, outFile=None):
     name = os.path.splitext(os.path.basename(filename))[0]
@@ -655,16 +693,16 @@ def printResultJSON(channels, multiplier, filename, outFile=None):
     if outFile:
         outFile.write(outString)
     else:
-        print outString
+        print(outString)
 
 def printResultString(channels, multiplier, filename, outFile=None):
     count = ord('A')
     name = os.path.splitext(os.path.basename(filename))[0]
 
     for channel in channels:
-        print "static const uint8_t music_" + str(name) + "_" + str(chr(count)) + "[] PROGMEM ="
-        print "{"
-        print "    ", str(multiplier) + ",",
+        print("static const uint8_t music_" + str(name) + "_" + str(chr(count)) + "[] PROGMEM =")
+        print("{")
+        print("    ", str(multiplier) + ",", end=' ')
         i = 1
         for note in channel:
             if i >= 16: #16 is good width for 100 column editors
@@ -680,19 +718,19 @@ def printResultString(channels, multiplier, filename, outFile=None):
                 outString = '{}, {},{}'.format(note[0], note[1], ninth)
                 i += 2
 
-            print outString,
-        print "END"
-        print "};\n"
+            print(outString, end=' ')
+        print("END")
+        print("};\n")
         count += 1
 
     outstring = '    {'
     for c in range(ord('A'), count):
         outstring += "music_" + str(name) + "_" + str(chr(c)) + ', '
     outstring = outstring[:-2] + "},\n"
-    print outstring
+    print(outstring)
 
     if outFile:
-        print "WARNING: Writing c format to file currently not supported"
+        print("WARNING: Writing c format to file currently not supported")
 
 
 initValueDict()
